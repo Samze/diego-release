@@ -100,6 +100,10 @@ func (info ExternalEndpointInfo) Hash() interface{} {
 	return info
 }
 
+func (info ExternalEndpointInfo) HashWithOptions() interface{} {
+	return info.Hash()
+}
+
 func (info ExternalEndpointInfo) MessageFor(e Endpoint, directInstanceRoute, _ bool) (*RegistryMessage, *tcpmodels.TcpRouteMapping, *RegistryMessage) {
 	tlsHostPort := -1
 	tlsContainerPort := -1
@@ -160,6 +164,10 @@ type Route struct {
 	Options          json.RawMessage
 }
 
+// routeHash is the stable identity key for a route, excluding options.
+// Two routes with equal routeHash values but different options are mutations
+// (options-only changes) that require only a re-register, not an
+// unregister+register pair.
 type routeHash struct {
 	Hostname         string
 	RouteServiceUrl  string
@@ -168,8 +176,20 @@ type routeHash struct {
 	Protocol         string
 }
 
-// route hash is used to find route differences
-// it needs to be dereferenced so that it can be used as a key in a hash map
+// routeHashWithOptions extends routeHash to include options.
+// Used by diffRoutes so that option-only changes (e.g. routable_by_default
+// toggling during canary promotion) trigger an immediate NATS re-registration
+// rather than waiting for the next heartbeat cycle.
+// Options is stored as a normalized JSON string (sorted keys, canonical
+// encoding) so that semantically identical option sets always compare equal
+// regardless of key ordering in the original json.RawMessage bytes.
+type routeHashWithOptions struct {
+	routeHash
+	Options string
+}
+
+// Hash returns the stable identity key for this route, excluding options.
+// It needs to be dereferenced so that it can be used as a key in a map.
 func (r Route) Hash() interface{} {
 	return routeHash{
 		Hostname:         r.Hostname,
@@ -177,6 +197,30 @@ func (r Route) Hash() interface{} {
 		IsolationSegment: r.IsolationSegment,
 		LogGUID:          r.LogGUID,
 		Protocol:         r.Protocol,
+	}
+}
+
+// HashWithOptions returns the full hash including options, used by diffRoutes
+// to detect options-only changes and trigger immediate re-registration.
+func (r Route) HashWithOptions() interface{} {
+	opts := string(r.Options)
+	if len(r.Options) > 0 {
+		var v interface{}
+		if err := json.Unmarshal(r.Options, &v); err == nil {
+			if b, err := json.Marshal(v); err == nil {
+				opts = string(b)
+			}
+		}
+	}
+	return routeHashWithOptions{
+		routeHash: routeHash{
+			Hostname:         r.Hostname,
+			RouteServiceUrl:  r.RouteServiceUrl,
+			IsolationSegment: r.IsolationSegment,
+			LogGUID:          r.LogGUID,
+			Protocol:         r.Protocol,
+		},
+		Options: opts,
 	}
 }
 
@@ -197,6 +241,10 @@ type InternalRoute struct {
 
 func (r InternalRoute) Hash() interface{} {
 	return r
+}
+
+func (r InternalRoute) HashWithOptions() interface{} {
+	return r.Hash()
 }
 
 func (r InternalRoute) MessageFor(endpoint Endpoint, _, emitEndpointUpdatedAt bool) (*RegistryMessage, *tcpmodels.TcpRouteMapping, *RegistryMessage) {

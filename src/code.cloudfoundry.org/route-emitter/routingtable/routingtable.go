@@ -425,7 +425,11 @@ func (t *internalRoutingTable) GetRoutingEvents() (TCPRouteMappings, MessagesToE
 
 type routeMapping interface {
 	MessageFor(endpoint Endpoint, directInstanceAddress, emitEndpointUpdatedAt bool) (*RegistryMessage, *tcpmodels.TcpRouteMapping, *RegistryMessage)
+	// Hash returns the stable identity key for this route, excluding options.
 	Hash() interface{}
+	// HashWithOptions returns the full hash including options, used by
+	// diffRoutes to detect options-only changes.
+	HashWithOptions() interface{}
 }
 
 func httpRoutesFrom(lrp *models.DesiredLRP) map[RoutingKey][]routeMapping {
@@ -619,27 +623,35 @@ type endpointsDiff struct {
 func diffRoutes(before, after []routeMapping) routesDiff {
 	existingRoutes := map[interface{}]routeMapping{}
 	newRoutes := map[interface{}]routeMapping{}
+	newIdentities := map[interface{}]struct{}{}
+
 	for _, route := range before {
-		existingRoutes[route.Hash()] = route
+		existingRoutes[route.HashWithOptions()] = route
 	}
 	for _, route := range after {
-		newRoutes[route.Hash()] = route
+		newRoutes[route.HashWithOptions()] = route
+		newIdentities[route.Hash()] = struct{}{}
 	}
 
 	diff := routesDiff{
 		before: before,
 		after:  after,
 	}
-	// generate the diff
-	for routeHash := range existingRoutes {
-		if _, ok := newRoutes[routeHash]; !ok {
-			diff.removed = append(diff.removed, existingRoutes[routeHash])
+	for fullHash, route := range existingRoutes {
+		if _, ok := newRoutes[fullHash]; ok {
+			continue
+		}
+		// Only unregister if the route identity is truly gone. When only options
+		// changed the identity still exists in newIdentities, and the register of
+		// the new version is sufficient — gorouter updates the entry in place.
+		if _, identityExists := newIdentities[route.Hash()]; !identityExists {
+			diff.removed = append(diff.removed, route)
 		}
 	}
 
-	for routeHash := range newRoutes {
-		if _, ok := existingRoutes[routeHash]; !ok {
-			diff.added = append(diff.added, newRoutes[routeHash])
+	for fullHash := range newRoutes {
+		if _, ok := existingRoutes[fullHash]; !ok {
+			diff.added = append(diff.added, newRoutes[fullHash])
 		}
 	}
 
@@ -706,7 +718,7 @@ func (table *internalRoutingTable) messages(routesDiff routesDiff, endpointDiff 
 
 	// for removed routes remove endpoints previously registered
 	for _, route := range routesDiff.removed {
-		rh := route.Hash()
+		rh := route.HashWithOptions()
 		for _, container := range endpointDiff.before {
 			if unregistrations[rh] != nil && unregistrations[rh][container] != nil {
 				continue
@@ -722,7 +734,7 @@ func (table *internalRoutingTable) messages(routesDiff routesDiff, endpointDiff 
 
 	// for added routes add all currently known endpoints
 	for _, route := range routesDiff.added {
-		rh := route.Hash()
+		rh := route.HashWithOptions()
 		for _, container := range endpointDiff.after {
 			if registrations[rh] != nil && registrations[rh][container] != nil {
 				continue
@@ -740,7 +752,7 @@ func (table *internalRoutingTable) messages(routesDiff routesDiff, endpointDiff 
 	// for removed endpoints remove routes previously registered
 	for _, container := range endpointDiff.removed {
 		for _, route := range routesDiff.before {
-			rh := route.Hash()
+			rh := route.HashWithOptions()
 			if unregistrations[rh] != nil && unregistrations[rh][container] != nil {
 				continue
 			}
@@ -756,7 +768,7 @@ func (table *internalRoutingTable) messages(routesDiff routesDiff, endpointDiff 
 	// for added endpoints register all current routes
 	for _, container := range endpointDiff.added {
 		for _, route := range routesDiff.after {
-			rh := route.Hash()
+			rh := route.HashWithOptions()
 			if registrations[rh] != nil && registrations[rh][container] != nil {
 				continue
 			}
